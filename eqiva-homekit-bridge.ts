@@ -30,7 +30,15 @@ const ACCESSORY_SERIAL   = '1234567890';
 
 
 
-import { createBluetooth, Bluetooth, Adapter, Device, GattServer, GattService, GattCharacteristic } from 'node-ble';
+import {
+  createBluetooth,
+  Bluetooth,
+  Adapter,
+  Device,
+  GattServer,
+  GattService,
+  GattCharacteristic,
+} from 'node-ble';
 import {
   Accessory,
   Service,
@@ -39,25 +47,25 @@ import {
   uuid as hapUUID,
   Categories,
 } from 'hap-nodejs';
-import { randomBytes, createCipheriv, createDecipheriv } from 'crypto';
+import { createCipheriv, createDecipheriv } from 'crypto';
 import { EventEmitter } from 'events';
 
 
 // BLE Service + Characteristic UUIDs (standard for Eqiva “keyble”):
-const LOCK_SERVICE_UUID = '0000fff0-0000-1000-8000-00805f9b34fb';
-const WRITE_CHAR_UUID    = '0000fff1-0000-1000-8000-00805f9b34fb';
-const NOTIFY_CHAR_UUID   = '0000fff2-0000-1000-8000-00805f9b34fb';
+const LOCK_SERVICE_UUID  = '58e06900-15d8-11e6-b737-0002a5d5c51b';
+const WRITE_CHAR_UUID    = '3141dd40-15db-11e6-a24b-0002a5d5c51b';
+const NOTIFY_CHAR_UUID   = '359d4820-15db-11e6-82bd-0002a5d5c51b';
 
 // HomeKit state constants:
 const HK_LOCK_CURRENT_STATE = {
+  UNSECURED: 0,    // fully unlocked
   SECURED: 1,      // fully locked
   JAMMED: 2,       // jammed
-  UNSECURED: 3,    // fully unlocked
-  UNKNOWN: 4,      // unknown
+  UNKNOWN: 3,      // unknown
 };
 const HK_LOCK_TARGET_STATE = {
-  SECURED: 1,     // lock
   UNSECURED: 0,   // unlock
+  SECURED: 1,     // lock
 };
 
 // BLE messages / framing
@@ -317,21 +325,28 @@ class EqivaLock extends EventEmitter {
         const lockStateRaw = frame.payload.readUInt8(0);
         const batteryLevel = frame.payload.readUInt8(1);
         const batteryStatusRaw = frame.payload.readUInt8(2);
-        // Translate lockStateRaw into a simpler boolean:
-        //   0x00 = Unlocked, 0x01 = Locked, 0x02 = Moving, 0x03 = Jammed
-        let isLocked: boolean;
+        let hkCurrent: number;
         switch (lockStateRaw) {
-          case 0x00: isLocked = false; break;
-          case 0x01: isLocked = true;  break;
-          case 0x02: // MOVING — treat as “unknown” for HomeKit
-          case 0x03: isLocked = false; break; // (or jammed; treat as unlocked)
+          case 0x00: // “unlocked”
+            hkCurrent = HK_LOCK_CURRENT_STATE.UNSECURED; // 0
+            break;
+          case 0x01: // “locked”
+            hkCurrent = HK_LOCK_CURRENT_STATE.SECURED;   // 1
+            break;
+          case 0x02: // “moving” (transition)
+            hkCurrent = HK_LOCK_CURRENT_STATE.UNKNOWN;   // 3
+            break;
+          case 0x03: // “jammed”
+            hkCurrent = HK_LOCK_CURRENT_STATE.JAMMED;    // 2
+            break;
           default:
-            isLocked = false;
+            hkCurrent = HK_LOCK_CURRENT_STATE.UNKNOWN;   // 3
+            break;
         }
         const isLowBattery = batteryStatusRaw === 0x01;
 
         // Emit a “status” event so HomeKit can update:
-        this.emit('status', { isLocked, batteryLevel, isLowBattery });
+        this.emit('status', { hkCurrent, batteryLevel, isLowBattery });
       }
 
     } catch (err) {
@@ -416,19 +431,13 @@ console.log(`[HomeKit] "${ACCESSORY_NAME}" published as a Lock accessory.`);
 const eqiva = new EqivaLock();
 
 // When EqivaLock emits a “status” event, update HomeKit characteristics:
-eqiva.on('status', ({ isLocked, batteryLevel, isLowBattery }) => {
-  console.log(`[HomeKit] Lock=${isLocked ? 'LOCKED' : 'UNLOCKED'}, Battery=${batteryLevel}% (Low=${isLowBattery})`);
+eqiva.on('status', ({ hkCurrent, batteryLevel, isLowBattery }) => {
+  console.log(`[HomeKit] LockCurrentState=${hkCurrent}, Battery=${batteryLevel}% (Low=${isLowBattery})`);
 
   // LockCurrentState = 1 (SECURED) if locked, else 3 (UNSECURED)
   lockService.setCharacteristic(
     Characteristic.LockCurrentState,
-    isLocked ? HK_LOCK_CURRENT_STATE.SECURED : HK_LOCK_CURRENT_STATE.UNSECURED
-  );
-
-  // LockTargetState should mirror LockCurrentState after action completes:
-  lockService.setCharacteristic(
-    Characteristic.LockTargetState,
-    isLocked ? HK_LOCK_TARGET_STATE.SECURED : HK_LOCK_TARGET_STATE.UNSECURED
+    hkCurrent
   );
 
   // Battery level (0…100)
