@@ -21,443 +21,295 @@ const HOMEKIT_ACCESSORY_PIN = '123-45-678'; // Change to a random 8 digit PIN
 // ─────────────────────────────────────────────────────────────────────────────
 
 // HomeKit accessory names + constants:
-const ACCESSORY_NAME     = 'Eqiva Smart Lock';
-const ACCESSORY_MANUFACTURER = 'Eqiva';
-const ACCESSORY_MODEL    = 'eQ-3 Bluetooth Smart Lock';
-const ACCESSORY_SERIAL   = '1234567890';
+const HOMEKIT_ACCESSORY_NAME     = 'Eqiva Smart Lock';
+const HOMEKIT_ACCESSORY_MANUFACTURER = 'Eqiva';
+const HOMEKIT_ACCESSORY_MODEL    = 'eQ-3 Bluetooth Smart Lock';
+const HOMEKIT_ACCESSORY_SERIAL   = '1234567890';
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 
 
-import {
-  createBluetooth,
-  Bluetooth,
-  Adapter,
-  Device,
-  GattServer,
-  GattService,
-  GattCharacteristic,
-} from 'node-ble';
-import {
-  Accessory,
-  Service,
-  Characteristic,
-  CharacteristicEventTypes,
-  uuid as hapUUID,
-  Categories,
-} from 'hap-nodejs';
-import { createCipheriv, createDecipheriv } from 'crypto';
-import { EventEmitter } from 'events';
 
+/***** ───────────────────────── CONSTANTS ───────────────────────── ******/
 
-// BLE Service + Characteristic UUIDs (standard for Eqiva “keyble”):
+// BLE GATT
 const LOCK_SERVICE_UUID  = '58e06900-15d8-11e6-b737-0002a5d5c51b';
 const WRITE_CHAR_UUID    = '3141dd40-15db-11e6-a24b-0002a5d5c51b';
 const NOTIFY_CHAR_UUID   = '359d4820-15db-11e6-82bd-0002a5d5c51b';
 
-// HomeKit state constants:
-const HK_LOCK_CURRENT_STATE = {
-  UNSECURED: 0,    // fully unlocked
-  SECURED: 1,      // fully locked
-  JAMMED: 2,       // jammed
-  UNKNOWN: 3,      // unknown
-};
-const HK_LOCK_TARGET_STATE = {
-  UNSECURED: 0,   // unlock
-  SECURED: 1,     // lock
-};
+// keyble message type IDs (subset)
+const MT = {
+  CONNECTION_REQUEST: 0x02,
+  CONNECTION_INFO:    0x03,
+  STATUS_REQUEST:     0x82,
+  STATUS_INFO:        0x83,
+  COMMAND:            0x87,
+  FRAGMENT_ACK:       0x00,
+  CLOSE_CONNECTION:   0x06,
+} as const;
 
-// BLE messages / framing
-// keyble message structure (16-byte blocks, AES CBC, no padding):
-//   [CRC16 over payload(2 bytes)] + [user_id (1)] + [cmd_id (1)] + [seq (1)] + [payload bytes…]
-//   then pad to 16 bytes with zeros. Then encrypt with AES-CBC using IV=all-zero.
-//
-// We will keep a rolling sequence counter (0…255).
-// For “lock” command, cmd_id = 0x01; for “unlock” cmd_id = 0x02; for “status” cmd_id = 0x04.
-//
-// The lock returns notifications with the same framing: we decrypt and parse out
-//   status info (lock state, battery level, etc.).
-//
-// These constants come straight from keyble’s message_types.js:
-enum CommandID {
-  GET_STATUS      = 0x04,
-  LOCK_DOOR       = 0x01,
-  UNLOCK_DOOR     = 0x02,
-  // (It may also support “T O G G L E” as 0x07, but we can issue lock/unlock explicitly.)
-}
+// command IDs
+enum CommandID { LOCK=0, UNLOCK=1, OPEN=2, }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// UTILITY FUNCTIONS: CRC16, AES ENCRYPT/DECRYPT, BUFFER FRAMING
-// ─────────────────────────────────────────────────────────────────────────────
+// HomeKit states
+const HK_LOCK_CURRENT_STATE = { UNSECURED:0, SECURED:1, JAMMED:2, UNKNOWN:3 } as const;
+const HK_LOCK_TARGET_STATE  = { UNSECURED:0, SECURED:1 } as const;
 
-// 1) CRC16-IBM (XModem) — same CRC16 used by keyble.
-function crc16Xmodem(buf: Buffer): number {
-  let crc = 0x0000;
-  for (let b of buf) {
-    crc ^= (b << 8);
-    for (let i = 0; i < 8; i++) {
-      if (crc & 0x8000) {
-        crc = ((crc << 1) ^ 0x1021) & 0xffff;
-      } else {
-        crc = (crc << 1) & 0xffff;
-      }
-    }
-  }
-  return crc & 0xffff;
-}
+// Node imports
+import { createBluetooth, Bluetooth, Adapter, Device, GattServer, GattCharacteristic, GattService } from 'node-ble';
+import { Accessory, Service, Characteristic, CharacteristicEventTypes, uuid as hapUUID, Categories } from 'hap-nodejs';
+import { randomBytes, createCipheriv } from 'crypto';
+import { EventEmitter } from 'events';
 
-// 2) Build a 16-byte AES frame for a command:
-let seqCounter = 0;
-function buildCommandPacket(cmdId: CommandID, payload: Buffer = Buffer.alloc(0)): Buffer {
-  // [CRC16(2 bytes)] [USER_ID (1)] [CMD_ID (1)] [SEQ (1)] [PAYLOAD…] [PAD…]
-  // Compute base (without CRC16):
-  const header = Buffer.alloc(4);
-  header.writeUInt8(USER_ID & 0xff, 0);        // offset 0 (we’ll write CRC16 later)
-  header.writeUInt8(cmdId & 0xff, 1);          // offset 1
-  header.writeUInt8(seqCounter & 0xff, 2);     // offset 2
-  header.writeUInt8(payload.length & 0xff, 3); // offset 3 (payload length)
-  seqCounter = (seqCounter + 1) & 0xff;
+/***** ─────────────────── LOW‑LEVEL PROTOCOL HELPERS ─────────────────── *****/
 
-  // Combine [header] + [payload] (but we’ll insert CRC16 bytes before header)
-  const combined = Buffer.concat([Buffer.alloc(2), header, payload]);
-  const crc = crc16Xmodem(combined.slice(2)); // compute over header+payload
-  combined.writeUInt16LE(crc, 0);            // write CRC16 into first 2 bytes
-
-  // Pad to 16-byte multiple (block size = 16)
-  if (combined.length < 16) {
-    return Buffer.concat([combined, Buffer.alloc(16 - combined.length, 0x00)]);
-  } else if (combined.length > 16) {
-    throw new Error(`Payload too large: ${combined.length} bytes (max 14)`);
-  }
-  return combined;
-}
-
-// 3) AES-128-CBC Encryption / Decryption (IV = 16 zero bytes, no padding)
 const AES_KEY = Buffer.from(USER_KEY_HEX, 'hex');
-const AES_IV  = Buffer.alloc(16, 0x00);
 
-function aesEncrypt(plain: Buffer): Buffer {
-  const cipher = createCipheriv('aes-128-cbc', AES_KEY, AES_IV);
+function aesEcbEncrypt(block16: Buffer): Buffer {
+  const cipher = createCipheriv('aes-128-ecb', AES_KEY, null);
   cipher.setAutoPadding(false);
-  const encrypted = Buffer.concat([cipher.update(plain), cipher.final()]);
-  return encrypted;
+  return Buffer.concat([cipher.update(block16), cipher.final()]);
 }
 
-function aesDecrypt(encrypted: Buffer): Buffer {
-  const decipher = createDecipheriv('aes-128-cbc', AES_KEY, AES_IV);
-  decipher.setAutoPadding(false);
-  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-  return decrypted;
+function xor(a: Buffer, b: Buffer): Buffer {
+  const out = Buffer.alloc(a.length);
+  for (let i=0;i<a.length;i++) out[i] = a[i] ^ b[i];
+  return out;
 }
 
-// 4) Parse a decrypted 16-byte response into { cmdId, seq, payload, rawStatus… }
-interface DecryptedFrame {
-  cmdId: number;
-  seq: number;
-  payload: Buffer;
-  raw: Buffer;
+// Generic ceil helper (same as keyble generic_ceil())
+const genericCeil = (x: number, step=16) => (Math.ceil(x/step)*step);
+
+// Convert int to BE Uint8Array
+const i2ba = (n: number, bytes: number): Buffer => {
+  const b = Buffer.alloc(bytes);
+  for (let i=0;i<bytes;i++) b[bytes-1-i] = (n >> (i*8)) & 0xff;
+  return b;
+};
+
+/** Compute nonce used by keyble’s CTR‑like stream */
+function computeNonce(messageType: number, sessionNonce: Buffer, securityCounter: number): Buffer {
+  return Buffer.concat([
+    Buffer.from([messageType]),
+    sessionNonce,                         // 8 bytes
+    Buffer.from([0x00,0x00]),             // unknown / always 0
+    i2ba(securityCounter, 2)              // 2 bytes, BE
+  ]);                                     // total 13 bytes
 }
-function parseResponseFrame(frame: Buffer): DecryptedFrame {
-  // Frame layout after decryption (16 bytes):
-  // [CRC16 (2)] [USER_ID (1)] [CMD_ID (1)] [SEQ (1)] [LEN (1)] [PAYLOAD…] [PAD…]
-  const crcRecvd = frame.readUInt16LE(0);
-  const bufForCRC = frame.slice(2); // from USER_ID onward
-  const crcCalc = crc16Xmodem(bufForCRC);
-  if (crcRecvd !== crcCalc) {
-    console.warn(`⚠️ CRC mismatch: recvd 0x${crcRecvd.toString(16)}, calc 0x${crcCalc.toString(16)}`);
+
+/** keyble “cryptData” – XOR plain with keystream derived from AES‑ECB */
+function cryptData(data: Buffer, mt: number, sessionNonce: Buffer, secCounter: number): Buffer {
+  const nonce = computeNonce(mt, sessionNonce, secCounter);
+  const blocks = Math.ceil(data.length/16);
+  const keystream: Buffer[] = [];
+  for (let i=0;i<blocks;i++) {
+    const ctrBlock = Buffer.concat([
+      Buffer.from([1]),     // constant 1
+      nonce,                // 13 bytes
+      i2ba(i+1,2),          // counter (1‑based)
+    ]); // 16 bytes
+    keystream.push(aesEcbEncrypt(ctrBlock));
   }
-  const userId = frame.readUInt8(2);
-  const cmdId  = frame.readUInt8(3);
-  const seq    = frame.readUInt8(4);
-  const len    = frame.readUInt8(5);
-  const payload = frame.slice(6, 6 + len);
-  return { cmdId, seq, payload, raw: frame };
+  const ks = Buffer.concat(keystream).slice(0, data.length);
+  return xor(data, ks);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// BLE + HomeKit “Glue” Class
-// ─────────────────────────────────────────────────────────────────────────────
+/** keyble “computeAuthenticationValue” – 4‑byte MIC */
+function computeAuth(data: Buffer, mt: number, sessionNonce: Buffer, secCounter: number): Buffer {
+  const nonce = computeNonce(mt, sessionNonce, secCounter);
+  const paddedLen = genericCeil(data.length,16);
+  const padded = Buffer.concat([data, Buffer.alloc(paddedLen-data.length)]);
+  let x = aesEcbEncrypt(Buffer.concat([Buffer.from([9]), nonce, i2ba(data.length,2)]));
+  for (let off=0; off<paddedLen; off+=16) {
+    x = aesEcbEncrypt(xor(x, padded.slice(off, off+16)));
+  }
+  const s0 = aesEcbEncrypt(Buffer.concat([Buffer.from([1]), nonce, Buffer.from([0x00,0x00])]))
+  return xor(x.slice(0,4), s0);
+}
+
+/***** ───────────────────── MESSAGE (DE)FRAGMENTATION ─────────────────── *****/
+
+function splitIntoFragments(full: Buffer): Buffer[] {
+  const chunks: Buffer[] = [];
+  for (let i=0;i<full.length; i+=15) chunks.push(full.slice(i,i+15));
+  return chunks.map((chunk,idx)=>{
+    const remaining = chunks.length-1-idx;
+    const status = remaining | (idx===0?0x80:0x00);
+    return Buffer.concat([Buffer.from([status]), chunk, Buffer.alloc(15-chunk.length)]);
+  });
+}
+
+function buildUnsecured(mt: number, data: Buffer): Buffer[] {
+  return splitIntoFragments(Buffer.concat([Buffer.from([mt]), data]));
+}
+
+function buildSecured(mt: number, dataPlain: Buffer, sessNonce: Buffer, secCounter: number): Buffer[] {
+  // pad dataPlain to multiple of 16 before encryption as per keyble
+  const paddedLen = genericCeil(dataPlain.length,16);
+  const padded = Buffer.concat([dataPlain, Buffer.alloc(paddedLen-dataPlain.length)]);
+  const crypted = cryptData(padded, mt, sessNonce, secCounter);
+  const auth = computeAuth(padded, mt, sessNonce, secCounter);
+  const final = Buffer.concat([Buffer.from([mt]), crypted, i2ba(secCounter,2), auth]);
+  return splitIntoFragments(final);
+}
+
+/***** ────────────────────── BLE / PROTOCOL CLASS ─────────────────────── *****/
 
 class EqivaLock extends EventEmitter {
-  private bluetooth: Bluetooth;
-  public destroy: () => void;
-  private adapter!: Adapter;
-  private device!: Device;
-  private gattServer!: GattServer;
-  private writeChar!: GattCharacteristic;
-  private notifyChar!: GattCharacteristic;
-  private isConnected = false;
-  private reconnectTimeout?: NodeJS.Timeout;
+  private bluetooth: Bluetooth; private adapter!: Adapter; private device!: Device;
+  private gatt!: GattServer; private write!: GattCharacteristic; private notify!: GattCharacteristic;
+  private connected = false; private reconnectTimer?: NodeJS.Timeout;
 
-  constructor() {
-    super();
-    // Create a Bluetooth session (node-ble)
-    const { bluetooth, destroy } = createBluetooth();
-    this.bluetooth = bluetooth;
-    this.destroy = destroy;
-  }
+  private localSessNonce = Buffer.alloc(8);      // generated on connect
+  private remoteSessNonce = Buffer.alloc(8);
+  private localSecCounter = 1;                   // increments with each secure tx
+  private remoteSecCounter = 0;
 
-  // Discover, connect, and set up notifications:
-  public async start(): Promise<void> {
-    console.log('[BLE] Initializing adapter…');
-    this.adapter = await this.bluetooth.defaultAdapter();
+  constructor() { super(); this.bluetooth = createBluetooth().bluetooth; }
 
-    // Continuously try to connect:
-    await this.attemptConnectLoop();
-  }
+  async start() { this.adapter = await this.bluetooth.defaultAdapter(); await this.loopConnect(); }
 
-  // Try to connect, and if fails, retry after a delay:
-  private async attemptConnectLoop(): Promise<void> {
+  private async loopConnect() {
     try {
-      console.log(`[BLE] Waiting for device ${MAC_ADDRESS}…`);
-      // Start discovery if not already:
-      if (! await this.adapter.isDiscovering()) {
-        await this.adapter.startDiscovery();
-      }
-
-      // Wait for the device to appear in discovery:
-      this.device = await this.adapter.waitDevice(MAC_ADDRESS, 30000);
-      console.log(`[BLE] Device found: ${MAC_ADDRESS}`);
-
-      // Stop discovery (optional, reduces BLE noise):
-      try { await this.adapter.stopDiscovery(); } catch { /* ignore */ }
-
-      // Connect:
+      console.log(`[BLE] Waiting for ${MAC_ADDRESS}…`);
+      if(!await this.adapter.isDiscovering()) await this.adapter.startDiscovery();
+      this.device = await this.adapter.waitDevice(MAC_ADDRESS,30000);
+      await this.adapter.stopDiscovery();
       await this.device.connect();
-      console.log(`[BLE] Connected to ${MAC_ADDRESS}`);
-      this.isConnected = true;
-      this.setupDisconnectListener();
+      this.connected = true;
+      console.log(`[BLE] Connected.`);
+      this.device.on('disconnect',()=>{console.warn('[BLE] disconnect');this.connected=false;this.scheduleReconnect();});
 
-      // Obtain GATT server, service, and characteristics:
-      this.gattServer = await this.device.gatt();
-      const service: GattService = await this.gattServer.getPrimaryService(LOCK_SERVICE_UUID);
-      this.writeChar = await service.getCharacteristic(WRITE_CHAR_UUID);
-      this.notifyChar = await service.getCharacteristic(NOTIFY_CHAR_UUID);
+      this.gatt = await this.device.gatt();
+      const svc: GattService = await this.gatt.getPrimaryService(LOCK_SERVICE_UUID);
+      this.write = await svc.getCharacteristic(WRITE_CHAR_UUID);
+      this.notify = await svc.getCharacteristic(NOTIFY_CHAR_UUID);
+      await this.notify.startNotifications();
+      this.notify.on('valuechanged', d=>this.onNotify(d));
 
-      // Set up notifications on the notifyChar:
-      await this.notifyChar.startNotifications();
-      this.notifyChar.on('valuechanged', (data: Buffer) => this.handleNotification(data));
+      await this.performHandshake();
+      await this.requestStatus();
+    } catch(e){ console.error('[BLE] error',e); this.scheduleReconnect(); }
+  }
 
-      // Immediately query status (battery + lock state):
-      this.sendGetStatus();
+  private scheduleReconnect(ms=5000){ if(this.reconnectTimer) return; this.reconnectTimer=setTimeout(()=>{this.reconnectTimer=undefined; this.loopConnect();},ms); }
 
-    } catch (err) {
-      console.error('[BLE] Connection error:', err);
-      this.scheduleReconnect();
+  private async performHandshake(){
+    this.localSessNonce = randomBytes(8);
+    // 1) send CONNECTION_REQUEST (unsecured)
+    const reqData = Buffer.concat([Buffer.from([USER_ID]), this.localSessNonce]);
+    await this.sendFragments(buildUnsecured(MT.CONNECTION_REQUEST, reqData));
+    console.log('[BLE→] CONNECTION_REQUEST');
+    // 2) wait for CONNECTION_INFO
+    await this.waitEvent('handshake-done',5000);
+  }
+
+  private async requestStatus(){
+    const now = new Date();
+    const data = Buffer.from([
+      now.getFullYear()-2000,
+      now.getMonth()+1,
+      now.getDate(), now.getHours(), now.getMinutes(), now.getSeconds()
+    ]);
+    await this.sendFragments(buildSecured(MT.STATUS_REQUEST, data, this.remoteSessNonce, this.localSecCounter++));
+    console.log('[BLE→] STATUS_REQUEST');
+  }
+
+  public async sendLock(){ await this.sendCmd(CommandID.LOCK); }
+  public async sendUnlock(){ await this.sendCmd(CommandID.UNLOCK); }
+
+  private async sendCmd(cmd: CommandID){
+    const data = Buffer.from([cmd]);
+    await this.sendFragments(buildSecured(MT.COMMAND, data, this.remoteSessNonce, this.localSecCounter++));
+    console.log(`[BLE→] ${(cmd===0?'LOCK':'UNLOCK')} sent`);
+  }
+
+  private async sendFragments(frags: Buffer[]){ for(const f of frags) await this.write.writeValueWithoutResponse(f); }
+
+  /***** ────────────── INCOMING NOTIFICATIONS ───────────── */
+  private rxBuffer: Buffer[] = [];
+  private onNotify(pkt16: Buffer){
+    const status = pkt16.readUInt8(0);
+    const isFirst = !!(status & 0x80);
+    const remaining = status & 0x7f;
+    const chunk = pkt16.slice(1);
+    if(isFirst) this.rxBuffer = [];
+    this.rxBuffer.push(chunk);
+    if(remaining===0){
+      const full = Buffer.concat(this.rxBuffer).slice(0,15*this.rxBuffer.length - (15- chunk.length));
+      const mt = full.readUInt8(0);
+      const body = full.slice(1);
+      this.handleMessage(mt, body);
     }
   }
 
-  // On unexpected disconnect, schedule a reconnect:
-  private setupDisconnectListener(): void {
-    this.device.on('disconnect', () => {
-      console.warn(`[BLE] Device ${MAC_ADDRESS} disconnected!`);
-      this.isConnected = false;
-      this.scheduleReconnect();
-    });
-  }
-
-  private scheduleReconnect(delayMs = 5000): void {
-    if (this.reconnectTimeout) {
-      return;
-    }
-    console.log(`[BLE] Scheduling reconnect in ${delayMs/1000}s…`);
-    this.reconnectTimeout = setTimeout(() => {
-      this.reconnectTimeout = undefined;
-      this.attemptConnectLoop();
-    }, delayMs);
-  }
-
-  // Build & send a “GET_STATUS” frame:
-  public async sendGetStatus(): Promise<void> {
-    if (!this.isConnected) return;
-    const pkt = buildCommandPacket(CommandID.GET_STATUS, Buffer.alloc(0));
-    const enc = aesEncrypt(pkt);
-    try {
-      await this.writeChar.writeValueWithoutResponse(enc);
-      console.log('[BLE→] GET_STATUS sent');
-    } catch (err) {
-      console.error('[BLE] Error writing GET_STATUS:', err);
+  private handleMessage(mt:number, body:Buffer){
+    switch(mt){
+      case MT.CONNECTION_INFO:{
+        this.remoteSessNonce = body.slice(1,9); // skip user_id
+        console.log('[BLE←] CONNECTION_INFO');
+        this.emit('handshake-done');
+        break;}
+      case MT.STATUS_INFO:{
+        // body = encrypted+secCtr+auth (variable)
+        const secCtr = body.readUInt16BE(body.length-6);
+        if(secCtr<=this.remoteSecCounter) return; // stale
+        this.remoteSecCounter = secCtr;
+        const auth = body.slice(-4);
+        const enc = body.slice(0,-6);
+        const plain = cryptData(enc, MT.STATUS_INFO, this.localSessNonce, secCtr);
+        const mic = computeAuth(plain, MT.STATUS_INFO, this.localSessNonce, secCtr);
+        if(!mic.equals(auth)){ console.warn('AUTH FAIL'); return; }
+        const lockStatus = plain.readUInt8(2) & 0x07; // see keyble docs
+        const batteryLow = (plain.readUInt8(1)&0x80)!==0;
+        let hk:number=HK_LOCK_CURRENT_STATE.UNKNOWN;
+        if(lockStatus===2) hk=HK_LOCK_CURRENT_STATE.UNSECURED;
+        else if(lockStatus===3) hk=HK_LOCK_CURRENT_STATE.SECURED;
+        else if(lockStatus===4) hk=HK_LOCK_CURRENT_STATE.UNSECURED;
+        else if(lockStatus===0) hk=HK_LOCK_CURRENT_STATE.UNKNOWN;
+        this.emit('status', { hkCurrent: hk, isLowBattery: batteryLow });
+        break;}
+      default:
+        console.log(`[BLE←] Unknown MT ${mt.toString(16)}`);
     }
   }
 
-  // Build & send a “LOCK” frame:
-  public async sendLockCommand(): Promise<void> {
-    if (!this.isConnected) throw new Error('Not connected to lock');
-    const pkt = buildCommandPacket(CommandID.LOCK_DOOR, Buffer.alloc(0));
-    const enc = aesEncrypt(pkt);
-    try {
-      await this.writeChar.writeValueWithoutResponse(enc);
-      console.log('[BLE→] LOCK sent');
-    } catch (err) {
-      console.error('[BLE] Error writing LOCK:', err);
-    }
-  }
-
-  // Build & send an “UNLOCK” frame:
-  public async sendUnlockCommand(): Promise<void> {
-    if (!this.isConnected) throw new Error('Not connected to lock');
-    const pkt = buildCommandPacket(CommandID.UNLOCK_DOOR, Buffer.alloc(0));
-    const enc = aesEncrypt(pkt);
-    try {
-      await this.writeChar.writeValueWithoutResponse(enc);
-      console.log('[BLE→] UNLOCK sent');
-    } catch (err) {
-      console.error('[BLE] Error writing UNLOCK:', err);
-    }
-  }
-
-  // Handle incoming notifications (encrypted 16-byte blobs):
-  private handleNotification(data: Buffer): void {
-    try {
-      const decrypted = aesDecrypt(data);
-      const frame = parseResponseFrame(decrypted);
-      // frame.cmdId will be the command context (e.g. GET_STATUS response)
-      // frame.payload includes raw status bytes. Typically payload length = 3:
-      //   [lockState (1)] [batteryLevel (1)] [batteryStatus (1)]
-      // e.g. lockState: 0x00 = unlocked, 0x01 = locked, 0x02 = moving, etc.
-      // batteryLevel: 0x00..0x64 = percentage,
-      // batteryStatus: 0x00 = OK, 0x01 = low.
-      console.log('[BLE←] Notification decrypted:', frame);
-
-      // Only propagate if it’s a GET_STATUS response:
-      if (frame.cmdId === CommandID.GET_STATUS) {
-        const lockStateRaw = frame.payload.readUInt8(0);
-        const batteryLevel = frame.payload.readUInt8(1);
-        const batteryStatusRaw = frame.payload.readUInt8(2);
-        let hkCurrent: number;
-        switch (lockStateRaw) {
-          case 0x00: // “unlocked”
-            hkCurrent = HK_LOCK_CURRENT_STATE.UNSECURED; // 0
-            break;
-          case 0x01: // “locked”
-            hkCurrent = HK_LOCK_CURRENT_STATE.SECURED;   // 1
-            break;
-          case 0x02: // “moving” (transition)
-            hkCurrent = HK_LOCK_CURRENT_STATE.UNKNOWN;   // 3
-            break;
-          case 0x03: // “jammed”
-            hkCurrent = HK_LOCK_CURRENT_STATE.JAMMED;    // 2
-            break;
-          default:
-            hkCurrent = HK_LOCK_CURRENT_STATE.UNKNOWN;   // 3
-            break;
-        }
-        const isLowBattery = batteryStatusRaw === 0x01;
-
-        // Emit a “status” event so HomeKit can update:
-        this.emit('status', { hkCurrent, batteryLevel, isLowBattery });
-      }
-
-    } catch (err) {
-      console.error('[BLE] Error handling notification:', err);
-    }
-  }
+  private async waitEvent(ev:string,timeout:number){ return new Promise((res,rej)=>{const t=setTimeout(()=>rej(new Error('timeout')),timeout); this.once(ev,(...a)=>{clearTimeout(t);res(a);});}); }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HOMEKIT SETUP
-// ─────────────────────────────────────────────────────────────────────────────
+/***** ────────────────────── HOMEKIT SETUP ─────────────────────────*****/
 
-// 1) Create a HomeKit Accessory
-const accessoryUUID = hapUUID.generate(ACCESSORY_NAME + ACCESSORY_SERIAL);
-const lockAccessory = new Accessory(ACCESSORY_NAME, accessoryUUID);
+const accessoryUUID = hapUUID.generate(HOMEKIT_ACCESSORY_NAME+HOMEKIT_ACCESSORY_SERIAL);
+const accessory = new Accessory(HOMEKIT_ACCESSORY_NAME, accessoryUUID);
+accessory.getService(Service.AccessoryInformation)!
+  .setCharacteristic(Characteristic.Manufacturer, HOMEKIT_ACCESSORY_MANUFACTURER)
+  .setCharacteristic(Characteristic.Model, HOMEKIT_ACCESSORY_MODEL)
+  .setCharacteristic(Characteristic.SerialNumber, HOMEKIT_ACCESSORY_SERIAL);
 
-// 2) Set basic accessory information
-lockAccessory
-  .getService(Service.AccessoryInformation)!
-  .setCharacteristic(Characteristic.Manufacturer, ACCESSORY_MANUFACTURER)
-  .setCharacteristic(Characteristic.Model, ACCESSORY_MODEL)
-  .setCharacteristic(Characteristic.SerialNumber, ACCESSORY_SERIAL);
+const lockService = accessory.addService(Service.LockMechanism, HOMEKIT_ACCESSORY_NAME);
+const batteryService = accessory.addService(Service.Battery);
 
-// 3) Add LockMechanism service
-const lockService = lockAccessory.addService(Service.LockMechanism, ACCESSORY_NAME);
-lockService
-  .getCharacteristic(Characteristic.LockCurrentState)
-  .on(CharacteristicEventTypes.GET, (callback) => {
-    // We’ll update this whenever we get a BLE notification. For now, respond unknown.
-    callback(null, HK_LOCK_CURRENT_STATE.UNKNOWN);
+lockService.getCharacteristic(Characteristic.LockTargetState)
+  .on(CharacteristicEventTypes.SET, async (value,cb)=>{
+    try{
+      if(value===HK_LOCK_TARGET_STATE.UNSECURED) await eqiva.sendUnlock();
+      else await eqiva.sendLock();
+      cb(null);
+    }catch(e){ cb(e as any); }
   });
 
-lockService
-  .getCharacteristic(Characteristic.LockTargetState)
-  .on(CharacteristicEventTypes.GET, (callback) => {
-    // We could track the “desired state” in local state if needed.
-    callback(null, HK_LOCK_TARGET_STATE.SECURED);
-  })
-  .on(CharacteristicEventTypes.SET, async (value, callback) => {
-    // value: 0 = UNSECURED (unlock), 1 = SECURED (lock)
-    try {
-      if (value === HK_LOCK_TARGET_STATE.UNSECURED) {
-        console.log('[HomeKit] Set target to UNLOCK');
-        await eqiva.sendUnlockCommand();
-      } else {
-        console.log('[HomeKit] Set target to LOCK');
-        await eqiva.sendLockCommand();
-      }
-      callback(null);
-    } catch (err) {
-      console.error('[HomeKit] Error sending lock/unlock:', err);
-      callback(err as any);
-    }
-  });
+accessory.publish({ username: HOMEKIT_ACCESSORY_USERNAME, pincode: HOMEKIT_ACCESSORY_PIN, category: Categories.DOOR_LOCK });
+console.log('[HomeKit] accessory published.');
 
-// 4) Add Battery service
-const batteryService = lockAccessory.addService(Service.Battery);
-batteryService
-  .getCharacteristic(Characteristic.StatusLowBattery)
-  .on(CharacteristicEventTypes.GET, (callback) => {
-    // We’ll update this as soon as we have a status from BLE.
-    callback(null, 0); // 0 = Battery Normal, 1 = Battery Low
-  });
-batteryService
-  .getCharacteristic(Characteristic.BatteryLevel)
-  .on(CharacteristicEventTypes.GET, (callback) => {
-    callback(null, 100); // Default to 100% until first status update
-  });
-
-// 5) “Publish” the accessory on the local network (mDNS)
-lockAccessory.publish({
-  username: HOMEKIT_ACCESSORY_USERNAME,
-  pincode: HOMEKIT_ACCESSORY_PIN,
-  category: Categories.DOOR_LOCK,
-});
-console.log(`[HomeKit] "${ACCESSORY_NAME}" published as a Lock accessory.`);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// “Glue” everything together
-// ─────────────────────────────────────────────────────────────────────────────
+/***** ───────────────────────── MAIN ───────────────────────── *****/
 
 const eqiva = new EqivaLock();
-
-// When EqivaLock emits a “status” event, update HomeKit characteristics:
-eqiva.on('status', ({ hkCurrent, batteryLevel, isLowBattery }) => {
-  console.log(`[HomeKit] LockCurrentState=${hkCurrent}, Battery=${batteryLevel}% (Low=${isLowBattery})`);
-
-  // LockCurrentState = 1 (SECURED) if locked, else 3 (UNSECURED)
-  lockService.setCharacteristic(
-    Characteristic.LockCurrentState,
-    hkCurrent
-  );
-
-  // Battery level (0…100)
-  batteryService.setCharacteristic(Characteristic.BatteryLevel, batteryLevel);
-  // StatusLowBattery (0 = Normal, 1 = Low)
-  batteryService.setCharacteristic(
-    Characteristic.StatusLowBattery,
-    isLowBattery ? 1 : 0
-  );
+eqiva.on('status', ({hkCurrent,isLowBattery})=>{
+  lockService.updateCharacteristic(Characteristic.LockCurrentState, hkCurrent);
+  batteryService.updateCharacteristic(Characteristic.StatusLowBattery, isLowBattery?1:0);
 });
 
-// Start BLE / Eqiva connection:
-eqiva.start()
-  .then(() => console.log('[BLE] EqivaLock.start() completed'))
-  .catch(err => console.error('[BLE] EqivaLock.start() error:', err));
+eqiva.start().catch(console.error);
 
-// Clean up on process exit:
-process.on('SIGINT', () => {
-  console.log('[Process] SIGINT received, cleaning up…');
-  lockAccessory.unpublish();
-  eqiva.destroy();   // terminate node-ble session
-  process.exit(0);
-});
+process.on('SIGINT', ()=>{ console.log('Exiting…'); accessory.unpublish(); process.exit(0); });
